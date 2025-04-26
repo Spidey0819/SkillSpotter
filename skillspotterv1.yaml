@@ -1,0 +1,3231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SkillSpotter - AI Resume Analyzer with Job Matching'
+
+#############################################
+# PARAMETERS
+#############################################
+Parameters:
+  ResumeBucketName:
+    Type: String
+    Description: Name for the S3 bucket storing resumes
+    Default: skillspotter-resumes-b01006794
+
+  JobDescBucketName:
+    Type: String
+    Description: Name for the S3 bucket storing job descriptions
+    Default: skillspotter-jobdesc-b01006794
+
+  LabRoleARN:
+    Type: String
+    Description: ARN of the existing LabRole
+    Default: 'arn:aws:iam::ACCOUNT_ID:role/LabRole'
+    
+  InstanceType:
+    Type: String
+    Description: EC2 instance type
+    Default: t2.large
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+
+Resources:
+  #############################################
+  # STORAGE RESOURCES
+  # Define an SSM Parameter to store API endpoint
+  ApiEndpointParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: '/skillspotter/api-endpoint'
+      Type: 'String'
+      Value: !Sub 'https://${AuthApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+      Description: 'SkillSpotter API Gateway URL'
+  #############################################
+  
+  ## S3 Buckets
+  ResumeBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref ResumeBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: [ '*' ]
+            AllowedMethods: [ GET, PUT, POST, DELETE, HEAD ]
+            AllowedOrigins: [ '*' ]
+            MaxAge: 3000
+
+  ResumeBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ResumeBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowDirectUploads
+            Effect: Allow
+            Principal: '*'
+            Action: [
+              's3:PutObject',
+              's3:PutObjectAcl',
+              's3:GetObject'
+            ]
+            Resource: !Sub 'arn:aws:s3:::${ResumeBucket}/*'
+
+  JobDescBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref JobDescBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: [ '*' ]
+            AllowedMethods: [ GET, PUT, POST, DELETE, HEAD ]
+            AllowedOrigins: [ '*' ]
+            MaxAge: 3000
+
+  JobDescBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref JobDescBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowDirectUploads
+            Effect: Allow
+            Principal: '*'
+            Action: [
+              's3:PutObject',
+              's3:PutObjectAcl',
+              's3:GetObject'
+            ]
+            Resource: !Sub 'arn:aws:s3:::${JobDescBucket}/*'
+
+  GlueScriptBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub 'skillspotter-glue-scripts-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+
+  ## DynamoDB Tables
+  UsersTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: SkillSpotter-Users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EmailIndex
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  ResumesTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: SkillSpotter-Resumes
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: resumeId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resumeId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  JobsTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: SkillSpotter-Jobs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+
+  SkillMatchesTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: SkillSpotter-SkillMatches
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: jobId
+          AttributeType: S
+        - AttributeName: skillScore
+          AttributeType: N
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: jobId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: SkillScoreIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: skillScore
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  #############################################
+  # NETWORK RESOURCES
+  #############################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: SkillSpotter-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: SkillSpotter-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: SkillSpotter-Public-Subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: SkillSpotter-Public-RT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH and HTTP
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SkillSpotter-Frontend-SG
+
+  #############################################
+  # API RESOURCES
+  #############################################
+  
+  ## Auth API (API Gateway + Lambda)
+  AuthApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: SkillSpotter-API
+      Description: API for SkillSpotter authentication and job management
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ## Auth Resources & Methods
+  AuthResourceRoot:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !GetAtt AuthApi.RootResourceId
+      PathPart: 'auth'
+
+  AuthResourceRegister:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !Ref AuthResourceRoot
+      PathPart: 'register'
+
+  AuthResourceLogin:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !Ref AuthResourceRoot
+      PathPart: 'login'
+
+  AuthResourceMe:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !Ref AuthResourceRoot
+      PathPart: 'me'
+
+  AuthResourceHealth:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !Ref AuthResourceRoot
+      PathPart: 'health'
+
+  ## CORS for Auth Endpoints
+  AuthMethodRegisterOptions:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AuthResourceRegister
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AuthMethodLoginOptions:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AuthResourceLogin
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AuthMethodMeOptions:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AuthResourceMe
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AuthMethodHealthOptions:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AuthResourceHealth
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ## Auth Actual HTTP Methods
+  AuthMethodRegisterPost:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AuthResourceRegister
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthLambdaFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: 201
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: 400
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: 500
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  AuthMethodLoginPost:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AuthResourceLogin
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthLambdaFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: 400
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: 500
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  AuthMethodMeGet:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AuthResourceMe
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthLambdaFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: 400
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: 500
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  AuthMethodHealthGet:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AuthResourceHealth
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthLambdaFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+        - StatusCode: 500
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  ## Job API Resources
+  JobsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !GetAtt AuthApi.RootResourceId
+      PathPart: 'jobs'
+
+  AdminResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !GetAtt AuthApi.RootResourceId
+      PathPart: 'admin'
+
+  AdminJobsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !Ref AdminResource
+      PathPart: 'jobs'
+
+  ## CORS for Jobs endpoints
+  JobsOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref JobsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminJobsOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AdminJobsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,GET,POST,PUT,DELETE'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ## Job Management Methods
+  JobsGetMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref JobsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JobManagementFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminJobsPostMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AdminJobsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JobManagementFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 201
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 400
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminJobsGetMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref AdminJobsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JobManagementFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ## Resume API Resources
+  UserResourceRoot:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !GetAtt AuthApi.RootResourceId
+      PathPart: 'user'
+
+  UserResumeResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !Ref UserResourceRoot
+      PathPart: 'resume'
+
+  UserResumeUploadResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ParentId: !Ref UserResumeResource
+      PathPart: 'upload'
+
+  ## CORS for Resume Upload endpoint
+  UserResumeUploadOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref UserResumeUploadResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{}'
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ## Resume Upload Method
+  UserResumeUploadPostMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResourceId: !Ref UserResumeUploadResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ResumeProcessorFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 400
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+        - StatusCode: 500
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ## Gateway Responses for CORS
+  GatewayResponse4XX:
+    Type: 'AWS::ApiGateway::GatewayResponse'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+
+  GatewayResponse5XX:
+    Type: 'AWS::ApiGateway::GatewayResponse'
+    Properties:
+      RestApiId: !Ref AuthApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+
+  ## Lambda Permissions
+  AuthLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref AuthLambdaFunction
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AuthApi}/*/*/*'
+
+  JobManagementPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref JobManagementFunction
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AuthApi}/*/*/*'
+      
+  ResumeProcessorPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ResumeProcessorFunction
+      Principal: 's3.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:s3:::${ResumeBucket}'
+      
+  ResumeProcessorApiPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ResumeProcessorFunction
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AuthApi}/prod/POST/user/resume/upload'
+
+  JobProcessorPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref JobProcessorFunction
+      Principal: 's3.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:s3:::${JobDescBucket}'
+
+  #############################################
+  # NOTIFICATION RESOURCES
+  #############################################
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SkillSpotter-Notifications
+      DisplayName: SkillSpotter Job Matches
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: goswamidhruv01@gmail.com
+      
+  ## API Deployment
+  ApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      - AuthMethodRegisterPost
+      - AuthMethodLoginPost
+      - AuthMethodMeGet
+      - AuthMethodHealthGet
+      - AuthMethodRegisterOptions
+      - AuthMethodLoginOptions
+      - AuthMethodMeOptions
+      - AuthMethodHealthOptions
+      - GatewayResponse4XX
+      - GatewayResponse5XX
+      - JobsOptionsMethod
+      - JobsGetMethod
+      - AdminJobsPostMethod
+      - AdminJobsGetMethod
+      - AdminJobsOptionsMethod
+      - UserResumeUploadPostMethod
+      - UserResumeUploadOptionsMethod
+    Properties:
+      RestApiId: !Ref AuthApi
+      StageName: 'prod'
+
+  #############################################
+  # COMPUTE RESOURCES
+  #############################################
+  
+  ## Lambda Functions
+  AuthLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: SkillSpotter-Auth
+      Handler: index.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import hashlib
+          import secrets
+          import time
+          from datetime import datetime
+          from boto3.dynamodb.conditions import Key, Attr
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # DynamoDB table name
+          USERS_TABLE = 'SkillSpotter-Users'
+
+          # Initialize DynamoDB resource
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(USERS_TABLE)
+
+          def lambda_handler(event, context):
+              # Log the incoming event for debugging
+              logger.info(f"Event received: {json.dumps(event)}")
+              
+              # Common headers for CORS support
+              headers = {
+                  "Access-Control-Allow-Origin": "*",
+                  "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                  "Access-Control-Allow-Methods": "OPTIONS,POST,GET",
+                  "Content-Type": "application/json"
+              }
+              
+              # Handle CORS preflight request
+              if event.get('httpMethod') == 'OPTIONS':
+                  logger.info("Handling OPTIONS request")
+                  return {
+                      "statusCode": 200,
+                      "headers": headers,
+                      "body": json.dumps({"message": "CORS enabled"})
+                  }
+              
+              # Get method and path from event
+              method = event.get('httpMethod', '')
+              path = event.get('path', '')
+              
+              # Extract the endpoint from the path (e.g., /auth/register -> register)
+              parts = path.rstrip('/').split('/')
+              endpoint = parts[-1] if parts else ''
+              
+              logger.info(f"Processing {method} request to endpoint: {endpoint}")
+              
+              try:
+                  # Route: /auth/register (Register a new user)
+                  if endpoint == 'register' and method == 'POST':
+                      logger.info("Handling registration request")
+                      
+                      # Parse request body
+                      body = {}
+                      if event.get('body'):
+                          body = json.loads(event.get('body'))
+                      
+                      email = body.get('email')
+                      password = body.get('password')
+                      name = body.get('name')
+                      
+                      logger.info(f"Registration request for: {email}")
+                      
+                      # Validate required fields
+                      if not email or not password:
+                          return {
+                              "statusCode": 400,
+                              "headers": headers,
+                              "body": json.dumps({"error": "Email and password are required"})
+                          }
+                      
+                      # Check if user already exists
+                      try:
+                          # Try to use GSI first for efficiency
+                          user_exists = False
+                          try:
+                              result = table.query(
+                                  IndexName="EmailIndex",
+                                  KeyConditionExpression=Key('email').eq(email)
+                              )
+                              user_exists = len(result.get('Items', [])) > 0
+                          except Exception:
+                              # Fall back to scan if GSI isn't working
+                              result = table.scan(FilterExpression=Attr('email').eq(email))
+                              user_exists = len(result.get('Items', [])) > 0
+                          
+                          if user_exists:
+                              logger.info(f"User with email {email} already exists")
+                              return {
+                                  "statusCode": 409,
+                                  "headers": headers,
+                                  "body": json.dumps({"error": "Email already registered"})
+                              }
+                      except Exception as e:
+                          logger.warning(f"Error checking if user exists: {str(e)}")
+                          # Handle error appropriately - return a proper error
+                          return {
+                              "statusCode": 500,
+                              "headers": headers,
+                              "body": json.dumps({"error": "Failed to check user existence"})
+                          }
+                      
+                      # Create the new user
+                      user_id = f"user_{int(time.time() * 1000)}"
+                      token = generate_token()
+                      hashed_password = hash_password(password)
+                      user_name = name if name else email.split('@')[0]
+                      created_at = datetime.utcnow().isoformat() + 'Z'
+                      
+                      # Store in DynamoDB
+                      try:
+                          user_item = {
+                              "userId": user_id,
+                              "email": email,
+                              "name": user_name,
+                              "password": hashed_password,
+                              "token": token,
+                              "createdAt": created_at
+                          }
+                          
+                          table.put_item(Item=user_item)
+                          logger.info(f"User saved to DynamoDB: {user_id}")
+                      except Exception as db_error:
+                          logger.error(f"Error saving to DynamoDB: {str(db_error)}")
+                          return {
+                              "statusCode": 500,
+                              "headers": headers,
+                              "body": json.dumps({"error": "Failed to create user account"})
+                          }
+                      
+                      # Return success with user info and token
+                      logger.info(f"Registration successful for {email}")
+                      return {
+                          "statusCode": 201,
+                          "headers": headers,
+                          "body": json.dumps({
+                              "userId": user_id,
+                              "email": email,
+                              "name": user_name,
+                              "token": token
+                          })
+                      }
+                  
+                  # Route: /auth/login (User login)
+                  elif endpoint == 'login' and method == 'POST':
+                      logger.info("Handling login request")
+                      
+                      # Parse request body
+                      body = {}
+                      if event.get('body'):
+                          body = json.loads(event.get('body'))
+                      
+                      email = body.get('email')
+                      password = body.get('password')
+                      
+                      logger.info(f"Login attempt for: {email}")
+                      
+                      # Validate required fields
+                      if not email or not password:
+                          return {
+                              "statusCode": 400,
+                              "headers": headers,
+                              "body": json.dumps({"error": "Email and password are required"})
+                          }
+                      
+                      # Find user by email
+                      user_found = False
+                      user = None
+                      
+                      try:
+                          try:
+                              # Try to use GSI first
+                              result = table.query(
+                                  IndexName="EmailIndex",
+                                  KeyConditionExpression=Key('email').eq(email)
+                              )
+                          except Exception as e:
+                              logger.warning(f"GSI query failed: {str(e)}, falling back to scan")
+                              # Fall back to scan
+                              result = table.scan(FilterExpression=Attr('email').eq(email))
+                          
+                          users = result.get('Items', [])
+                          if users:
+                              user = users[0]
+                              user_found = True
+                              logger.info(f"User found: {user.get('userId')}")
+                          else:
+                              logger.info(f"No user found with email: {email}")
+                              return {
+                                  "statusCode": 401,
+                                  "headers": headers,
+                                  "body": json.dumps({"error": "Invalid email or password"})
+                              }
+                      except Exception as e:
+                          logger.error(f"Error finding user: {str(e)}")
+                          return {
+                              "statusCode": 500,
+                              "headers": headers,
+                              "body": json.dumps({"error": "Error during authentication"})
+                          }
+                      
+                      # Verify password
+                      stored_password = user.get('password', '')
+                      hashed_input = hash_password(password)
+                      
+                      if stored_password != hashed_input:
+                          logger.warning(f"Password mismatch for {email}")
+                          return {
+                              "statusCode": 401,
+                              "headers": headers,
+                              "body": json.dumps({"error": "Invalid email or password"})
+                          }
+                      
+                      # Generate new token
+                      new_token = generate_token()
+                      
+                      # Update token in DynamoDB
+                      try:
+                          table.update_item(
+                              Key={"userId": user["userId"]},
+                              UpdateExpression="SET token = :token",
+                              ExpressionAttributeValues={":token": new_token}
+                          )
+                          logger.info(f"Token updated for user: {user['userId']}")
+                      except Exception as db_error:
+                          logger.error(f"Failed to update token: {str(db_error)}")
+                          return {
+                              "statusCode": 500,
+                              "headers": headers,
+                              "body": json.dumps({"error": "Error updating authentication token"})
+                          }
+                      
+                      # Return success with user info
+                      logger.info(f"Login successful for: {email}")
+                      return {
+                          "statusCode": 200,
+                          "headers": headers,
+                          "body": json.dumps({
+                              "userId": user["userId"],
+                              "email": user["email"],
+                              "name": user.get("name", name_from_email(email)),
+                              "token": new_token
+                          })
+                      }
+                  
+                  # Route: /auth/me (Get current user info)
+                  elif endpoint == 'me' and method == 'GET':
+                      logger.info("Handling get user info request")
+                      
+                      # Get token from header
+                      request_headers = event.get('headers', {})
+                      auth_header = request_headers.get('Authorization') or request_headers.get('authorization')
+                      
+                      if not auth_header:
+                          logger.warning("No auth header provided")
+                          return {
+                              "statusCode": 401,
+                              "headers": headers,
+                              "body": json.dumps({"error": "No token provided"})
+                          }
+                      
+                      # Remove 'Bearer ' prefix if it exists
+                      token = auth_header.replace("Bearer ", "")
+                      logger.info(f"Looking up user by token: {token[:10]}...")
+                      
+                      # Find user by token
+                      try:
+                          result = table.scan(FilterExpression=Attr('token').eq(token))
+                          users = result.get('Items', [])
+                          
+                          if not users:
+                              logger.warning(f"No user found with token: {token[:10]}...")
+                              return {
+                                  "statusCode": 401,
+                                  "headers": headers,
+                                  "body": json.dumps({"error": "Invalid or expired token"})
+                              }
+                          
+                          user = users[0]
+                          logger.info(f"User found by token: {user.get('userId')}")
+                          
+                          # Return user info (exclude sensitive fields)
+                          return {
+                              "statusCode": 200,
+                              "headers": headers,
+                              "body": json.dumps({
+                                  "userId": user["userId"],
+                                  "email": user["email"],
+                                  "name": user.get("name", "User")
+                              })
+                          }
+                      except Exception as db_error:
+                          logger.error(f"Error fetching user by token: {str(db_error)}")
+                          return {
+                              "statusCode": 500,
+                              "headers": headers,
+                              "body": json.dumps({"error": "Error validating authentication"})
+                          }
+                  
+                  # Route: /auth/health (Health check)
+                  elif endpoint == 'health' and method == 'GET':
+                      logger.info("Handling health check")
+                      
+                      # Check if we can connect to DynamoDB
+                      try:
+                          table.scan(Limit=1)
+                          db_status = "connected"
+                      except Exception as e:
+                          logger.error(f"DynamoDB connection error: {str(e)}")
+                          db_status = "disconnected"
+                      
+                      return {
+                          "statusCode": 200,
+                          "headers": headers,
+                          "body": json.dumps({
+                              "status": "healthy",
+                              "database": db_status,
+                              "message": "Auth API is up and running",
+                              "timestamp": datetime.utcnow().isoformat() + 'Z'
+                          })
+                      }
+                  
+                  # If no endpoint matched
+                  else:
+                      logger.warning(f"Unknown endpoint: {endpoint}")
+                      
+                      return {
+                          "statusCode": 404,
+                          "headers": headers,
+                          "body": json.dumps({"error": "Not found"})
+                      }
+              
+              except Exception as e:
+                  # Log any errors for debugging
+                  logger.error(f"Error processing request: {str(e)}")
+                  
+                  # Return a 500 error
+                  return {
+                      "statusCode": 500,
+                      "headers": headers,
+                      "body": json.dumps({"error": "Internal server error"})
+                  }
+
+          def generate_token():
+              """Generate a secure random token"""
+              return secrets.token_hex(32)
+
+          def hash_password(password):
+              """Hash password using SHA-256"""
+              return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+          def name_from_email(email):
+              """Extract a name from an email address."""
+              if not email or '@' not in email:
+                  return "User"
+              return email.split('@')[0].replace('.', ' ').title()
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+
+  JobManagementFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: SkillSpotter-JobManagement
+      Handler: index.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          from datetime import datetime
+          import logging
+          from boto3.dynamodb.conditions import Key, Attr
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize DynamoDB client
+          dynamodb = boto3.resource('dynamodb')
+          jobs_table = dynamodb.Table('SkillSpotter-Jobs')
+
+          def lambda_handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+              
+              # CORS headers for all responses
+              headers = {
+                  "Access-Control-Allow-Origin": "*",
+                  "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                  "Access-Control-Allow-Methods": "OPTIONS,POST,GET,PUT,DELETE",
+                  "Content-Type": "application/json"
+              }
+              
+              try:
+                  # Get HTTP method and path
+                  http_method = event.get('httpMethod')
+                  path = event.get('path', '')
+                  
+                  # Handle OPTIONS request for CORS
+                  if http_method == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': headers,
+                          'body': json.dumps({'message': 'CORS enabled'})
+                      }
+                  
+                  # Extract path components to determine operation
+                  path_parts = path.strip('/').split('/')
+                  
+                  # Determine if this is an admin route
+                  is_admin = 'admin' in path_parts
+                  
+                  # Get the request body for POST/PUT requests
+                  request_body = {}
+                  if event.get('body'):
+                      request_body = json.loads(event.get('body'))
+                  
+                  # Check Authorization header for token (optional - can be implemented)
+                  request_headers = event.get('headers', {})
+                  auth_header = request_headers.get('Authorization') or request_headers.get('authorization', '')
+                  
+                  # ADMIN ROUTES: POST /admin/jobs - Create a new job
+                  if is_admin and 'jobs' in path_parts and http_method == 'POST':
+                      return create_job(request_body, headers)
+                  
+                  # ADMIN ROUTES: GET /admin/jobs - List all jobs
+                  elif is_admin and 'jobs' in path_parts and http_method == 'GET':
+                      return list_jobs(event, headers, is_admin=True)
+                  
+                  # PUBLIC ROUTES: GET /jobs - List available jobs
+                  elif 'jobs' in path_parts and http_method == 'GET':
+                      return list_jobs(event, headers, is_admin=False)
+                  
+                  # Route not found
+                  return {
+                      'statusCode': 404,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'error': 'Not found',
+                          'message': f"No handler for {http_method} {path}"
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing request: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e)
+                      })
+                  }
+
+          def create_job(request_body, headers):
+              """Create a new job posting"""
+              
+              # Extract data from request
+              title = request_body.get('title', '')
+              company = request_body.get('company', '')
+              location = request_body.get('location', '')
+              job_type = request_body.get('type', 'Full-time')
+              description = request_body.get('description', '')
+              skills = request_body.get('skills', [])
+              
+              # Validate required fields
+              if not title or not company or not description:
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'error': 'Bad request',
+                          'message': 'Missing required fields (title, company, description)'
+                      })
+                  }
+              
+              # Generate a unique ID for the job
+              job_id = str(uuid.uuid4())
+              timestamp = datetime.utcnow().isoformat() + 'Z'
+              
+              # Create job item for DynamoDB
+              job_item = {
+                  'jobId': job_id,
+                  'title': title,
+                  'company': company,
+                  'location': location,
+                  'type': job_type,
+                  'description': description,
+                  'requiredSkills': skills,
+                  'postTimestamp': timestamp,
+                  'status': request_body.get('status', 'ACTIVE')
+              }
+              
+              # Add optional fields if present
+              for field in ['requirements', 'benefits', 'salary', 'remote', 'featured']:
+                  if field in request_body:
+                      job_item[field] = request_body[field]
+              
+              # Store in DynamoDB
+              logger.info(f"Storing job item: {job_item}")
+              jobs_table.put_item(Item=job_item)
+              
+              # Return success response
+              return {
+                  'statusCode': 201,
+                  'headers': headers,
+                  'body': json.dumps({
+                      'jobId': job_id,
+                      'message': 'Job created successfully',
+                      'title': title,
+                      'company': company,
+                      'timestamp': timestamp
+                  })
+              }
+
+          def list_jobs(event, headers, is_admin=False):
+              """List jobs with optional filtering"""
+              
+              # Parse query parameters
+              query_params = event.get('queryStringParameters', {}) or {}
+              
+              # Get pagination params
+              page = int(query_params.get('page', 1))
+              limit = int(query_params.get('limit', 10))
+              
+              # Determine if we need filtering
+              filter_expression = None
+              expression_values = {}
+              
+              # If not admin, only show active jobs
+              if not is_admin:
+                  filter_expression = Attr('status').eq('ACTIVE')
+              
+              # Add more filters based on query parameters
+              if 'search' in query_params and query_params['search']:
+                  search_term = query_params['search'].lower()
+                  # Note: This is a simplified search
+                  if filter_expression:
+                      filter_expression = filter_expression & (
+                          Attr('title').contains(search_term) | 
+                          Attr('company').contains(search_term) |
+                          Attr('description').contains(search_term)
+                      )
+                  else:
+                      filter_expression = (
+                          Attr('title').contains(search_term) | 
+                          Attr('company').contains(search_term) |
+                          Attr('description').contains(search_term)
+                      )
+              
+              # Perform the query/scan
+              try:
+                  if filter_expression:
+                      response = jobs_table.scan(FilterExpression=filter_expression)
+                  else:
+                      response = jobs_table.scan()
+                  
+                  jobs = response.get('Items', [])
+                  
+                  # Sort by timestamp (newest first)
+                  jobs.sort(key=lambda x: x.get('postTimestamp', ''), reverse=True)
+                  
+                  # Format jobs for frontend consumption
+                  formatted_jobs = []
+                  for job in jobs:
+                      # Convert DynamoDB format to frontend expected format
+                      formatted_job = {
+                          'id': job.get('jobId'),
+                          'title': job.get('title', 'Untitled Job'),
+                          'company': job.get('company', ''),
+                          'location': job.get('location', ''),
+                          'description': job.get('description', ''),
+                          'matchPercentage': job.get('matchPercentage', 0),  # For user views
+                          'postedDate': job.get('postTimestamp', ''),
+                          'applied': False,  # Default value
+                          'remote': job.get('remote', False),
+                          'type': job.get('type', 'Full-time'),
+                          'status': job.get('status', 'ACTIVE')
+                      }
+                      
+                      # Add required skills in the expected format
+                      if 'requiredSkills' in job:
+                          formatted_job['skills'] = job['requiredSkills']
+                      
+                      formatted_jobs.append(formatted_job)
+                  
+                  # Apply pagination
+                  total_results = len(formatted_jobs)
+                  start_idx = (page - 1) * limit
+                  end_idx = start_idx + limit
+                  paginated_jobs = formatted_jobs[start_idx:end_idx]
+                  
+                  # Calculate total pages
+                  total_pages = (total_results + limit - 1) // limit  # Ceiling division
+                  
+                  # Return the expected response format
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'jobs': paginated_jobs,
+                          'page': page,
+                          'limit': limit,
+                          'totalPages': total_pages,
+                          'totalResults': total_results
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error listing jobs: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'error': 'Failed to list jobs',
+                          'message': str(e)
+                      })
+                  }
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+      
+  ResumeProcessorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: SkillSpotter-ResumeProcessor
+      Handler: index.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import urllib.parse
+          from datetime import datetime
+          import re
+          import logging
+          import time
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients with explicit region
+          region = os.environ.get('AWS_REGION', 'us-east-1')
+          s3 = boto3.client('s3', region_name=region)
+          textract = boto3.client('textract', region_name=region)
+          dynamodb = boto3.resource('dynamodb', region_name=region)
+          sns = boto3.client('sns', region_name=region)
+          glue = boto3.client('glue', region_name=region)
+
+          # Constants
+          RESUME_TABLE = 'SkillSpotter-Resumes'
+          JOBS_TABLE = 'SkillSpotter-Jobs'
+          MATCHES_TABLE = 'SkillSpotter-SkillMatches'
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          GLUE_JOB_NAME = 'SkillSpotter-SkillAnalytics'
+
+          # In the ResumeProcessorFunction Lambda function
+
+          def lambda_handler(event, context):
+              logger.info(f"Event received: {json.dumps(event)}")
+              
+              try:
+                  # Extract bucket and key from S3 event
+                  bucket = None
+                  key = None
+                  user_id = None  # Initialize user_id as None
+                  
+                  if 'Records' in event and len(event['Records']) > 0 and 's3' in event['Records'][0]:
+                      # This is an S3 event
+                      bucket = event['Records'][0]['s3']['bucket']['name']
+                      key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'])
+                      logger.info(f"Processing upload from S3 event: {bucket}/{key}")
+                      
+                      # Try to extract user ID from key path - assume uploads/{userId}/filename.pdf format
+                      key_parts = key.split('/')
+                      if len(key_parts) >= 2 and key_parts[0] == 'uploads':
+                          potential_user_id = key_parts[1]
+                          if not potential_user_id.endswith('.pdf') and not potential_user_id.endswith('.docx'):
+                              # This might be a user ID folder
+                              user_id = potential_user_id
+                              logger.info(f"Extracted potential user_id from path: {user_id}")
+                  else:
+                      # API Gateway request
+                      bucket = event.get('bucket', '')
+                      key = event.get('key', '')
+                      
+                      # Extract user ID from request body or headers
+                      if event.get('body'):
+                          try:
+                              body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                              user_id = body.get('userId')
+                              logger.info(f"Extracted user_id from request body: {user_id}")
+                          except Exception as e:
+                              logger.warning(f"Could not parse request body: {str(e)}")
+                      
+                      # Try to get from headers if not in body
+                      if not user_id and event.get('headers'):
+                          auth_header = event['headers'].get('Authorization') or event['headers'].get('authorization')
+                          if auth_header:
+                              # Parse JWT token or other auth mechanism
+                              token = auth_header.replace('Bearer ', '')
+                              try:
+                                  # Query DynamoDB to get user by token
+                                  users_table = dynamodb.Table('SkillSpotter-Users')
+                                  response = users_table.scan(
+                                      FilterExpression=Attr('token').eq(token)
+                                  )
+                                  users = response.get('Items', [])
+                                  if users:
+                                      user_id = users[0]['userId']
+                                      logger.info(f"Found user_id from token: {user_id}")
+                              except Exception as e:
+                                  logger.warning(f"Error looking up user by token: {str(e)}")
+                      
+                      if key:
+                          key = urllib.parse.unquote_plus(key)
+                      logger.info(f"Processing from API event: {bucket}/{key}")
+                  
+                  # If still no user ID, try to extract from key name pattern
+                  if not user_id and key:
+                      # Try to find user ID pattern in key name
+                      match = re.search(r'user[_-]([a-zA-Z0-9]+)', key)
+                      if match:
+                          user_id = match.group(1)
+                          logger.info(f"Extracted user_id from filename pattern: {user_id}")
+                  
+                  # If still no user_id, query the Users table for the first active user
+                  # (This is a fallback and should be removed in production)
+                  if not user_id:
+                      logger.warning("No user ID found in request, looking up in Users table")
+                      try:
+                          users_table = dynamodb.Table('SkillSpotter-Users')
+                          response = users_table.scan(Limit=1)
+                          if response.get('Items'):
+                              user_id = response['Items'][0]['userId']
+                              logger.info(f"Using first user found in table: {user_id}")
+                          else:
+                              # Last resort fallback - use a default value but log warning
+                              user_id = "unknown_user"
+                              logger.warning(f"No users found in table, using default: {user_id}")
+                      except Exception as e:
+                          logger.error(f"Error querying Users table: {str(e)}")
+                          user_id = "unknown_user"
+                          logger.warning(f"Error fetching users, using default: {user_id}")
+                  
+                  if not bucket:
+                      error_msg = "No bucket specified in event"
+                      logger.error(error_msg)
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Find the most recent file in uploads/ if key is not specified or incomplete
+                  if not key or key == 'uploads/' or not key.startswith('uploads/'):
+                      logger.info(f"Key is missing or incomplete: '{key}'. Finding most recent upload...")
+                      # ... (existing code for finding recent uploads)
+                  
+                  # Generate a unique ID for this resume
+                  resume_id = str(uuid.uuid4())
+                  # user_id is now dynamically determined instead of hardcoded
+                  logger.info(f"Processing resume for user: {user_id}")
+                                   
+                  try:
+                      # Get the file content
+                      logger.info(f"Getting S3 object: {bucket}/{key}")
+                      response = s3.get_object(Bucket=bucket, Key=key)
+                      content_type = response.get('ContentType', '')
+                      logger.info(f"File content type: {content_type}")
+                      file_bytes = response['Body'].read()
+                      file_size = len(file_bytes)
+                      logger.info(f"File size: {file_size} bytes")
+                      
+                      # Get file extension
+                      file_name = os.path.basename(key)
+                      file_ext = os.path.splitext(file_name)[1].lower() if '.' in file_name else ''
+                      logger.info(f"File name: {file_name}, extension: {file_ext}")
+                      
+                      # Extract text using Textract
+                      extracted_text = ""
+                      
+                      # Try with bytes method first
+                      try:
+                          logger.info(f"Attempting to extract text with Textract bytes method from {file_ext} file")
+                          textract_response = textract.detect_document_text(
+                              Document={
+                                  'Bytes': file_bytes
+                              }
+                          )
+                          
+                          # Process Textract response
+                          for block in textract_response.get('Blocks', []):
+                              if block.get('BlockType') == 'LINE':
+                                  extracted_text += block.get('Text', '') + "\n"
+                          
+                          logger.info(f"Extracted {len(extracted_text.strip())} characters with Textract bytes method")
+                          
+                      except Exception as textract_error:
+                          logger.error(f"Error using Textract bytes method: {str(textract_error)}")
+                          
+                          # If file is PDF, try Textract with S3Object approach as fallback
+                          if file_ext.lower() == '.pdf':
+                              try:
+                                  logger.info("Trying S3Object method with Textract for PDF")
+                                  # Reference the S3 object for PDF processing
+                                  textract_response = textract.detect_document_text(
+                                      Document={
+                                          'S3Object': {
+                                              'Bucket': bucket,
+                                              'Name': key
+                                          }
+                                      }
+                                  )
+                                  
+                                  # Process Textract response
+                                  for block in textract_response.get('Blocks', []):
+                                      if block.get('BlockType') == 'LINE':
+                                          extracted_text += block.get('Text', '') + "\n"
+                                  
+                                  logger.info(f"Extracted {len(extracted_text.strip())} characters with Textract S3Object method")
+                                      
+                              except Exception as s3_textract_error:
+                                  logger.error(f"Error using Textract with S3Object: {str(s3_textract_error)}")
+                      
+                      # If still no text, return error
+                      if not extracted_text.strip():
+                          extracted_text = f"Unable to extract text from resume: {file_name}"
+                          logger.warning("No text could be extracted from the document")
+                          
+                          # Notify user about extraction issue
+                          sns.publish(
+                              TopicArn=SNS_TOPIC_ARN,
+                              Subject="Resume Processing Issue",
+                              Message=f"We had difficulty extracting text from your resume. This may affect our ability to match your skills. Consider uploading a different format or ensuring the text in your PDF is not image-based."
+                          )
+                      
+                      logger.info(f"Final extracted text (sample): {extracted_text[:200]}...")
+                      
+                  except Exception as get_error:
+                      error_msg = f"Error processing file: {str(get_error)}"
+                      logger.error(error_msg)
+                      sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject="Error Processing Resume",
+                          Message=f"Error processing your resume: {error_msg}"
+                      )
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Extract skills from text
+                  skills = extract_skills(extracted_text)
+                  logger.info(f"Extracted skills: {skills}")
+                  
+                  # Store in DynamoDB
+                  resume_table = dynamodb.Table(RESUME_TABLE)
+                  timestamp = datetime.now().isoformat()
+                  
+                  resume_item = {
+                      'resumeId': resume_id,
+                      'userId': user_id,
+                      'originalKey': key,
+                      'fileName': file_name,
+                      'fileType': file_ext,
+                      'extractedText': extracted_text,
+                      'extractedSkills': skills,
+                      'uploadTimestamp': timestamp,
+                      'status': 'PROCESSED'
+                  }
+                  
+                  resume_table.put_item(Item=resume_item)
+                  logger.info(f"Resume data stored in DynamoDB with ID: {resume_id}")
+                  
+                  # Match with jobs
+                  match_count = match_jobs_with_skills(skills, user_id)
+                  logger.info(f"Found {match_count} job matches")
+                  
+                  # Try to start the Glue job for skill analysis
+                  try:
+                      logger.info(f"Starting Glue job: {GLUE_JOB_NAME}")
+                      glue_response = glue.start_job_run(
+                          JobName=GLUE_JOB_NAME,
+                          Arguments={
+                              '--userId': user_id,
+                              '--job-bookmark-option': 'job-bookmark-disable',
+                              '--run-id': f'user-analysis-{user_id}-{int(time.time())}'  # Add unique run ID
+                          }
+                      )
+                      job_run_id = glue_response.get('JobRunId')
+                      logger.info(f"Successfully started Glue job with run ID: {job_run_id}")
+                  except Exception as glue_error:
+                      logger.error(f"Error starting Glue job: {str(glue_error)}")
+                  
+                  # Send notification about results
+                  if match_count > 0:
+                      sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject="New Job Matches Found",
+                          Message=f"We found {match_count} potential job matches for your resume! Check your dashboard for details."
+                      )
+                      logger.info(f"SNS notification sent to topic: {SNS_TOPIC_ARN}")
+                  else:
+                      # Send notification that processing completed but no matches found
+                      sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject="Resume Processed Successfully",
+                          Message="Your resume has been successfully processed, but no job matches were found at this time. Try adding more skills to your resume!"
+                      )
+                      logger.info("Sent notification about successful processing but no matches")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Resume processed successfully',
+                          'resumeId': resume_id,
+                          'fileName': file_name,
+                          'matches': match_count,
+                          'skills': skills
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing resume: {str(e)}", exc_info=True)
+                  # Try to send error notification
+                  try:
+                      sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject="Error Processing Resume",
+                          Message=f"An error occurred while processing your resume: {str(e)}"
+                      )
+                  except Exception as sns_error:
+                      logger.error(f"Error sending SNS notification: {str(sns_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+
+          def extract_skills(text):
+              # Convert to lowercase for case-insensitive matching
+              text_lower = text.lower()
+              
+              # Extended list of skills to detect
+              skill_list = [
+                  "python", "java", "javascript", "html", "css", "react", "angular", "vue", 
+                  "node.js", "express", "django", "flask", "spring", "spring boot", "hibernate", 
+                  "sql", "mysql", "postgresql", "mongodb", "nosql", "oracle", 
+                  "aws", "azure", "gcp", "docker", "kubernetes", "jenkins", "git", 
+                  "agile", "scrum", "jira", "devops", "ci/cd", "terraform",
+                  "machine learning", "deep learning", "ai", "data science", "data analysis",
+                  "tableau", "power bi", "excel", "word", "powerpoint", "typescript",
+                  "project management", "leadership", "communication", "teamwork", "kotlin",
+                  "react.js", "node.js", "nosql", "rest", "restful", "api", "apis", "json",
+                  "xml", "linux", "unix", "bash", "shell", "c++", "c#", ".net", "perl",
+                  "responsive", "mobile", "spark", "hadoop", "kafka", "redis", "elasticsearch"
+              ]
+              
+              # Find skills in text
+              found_skills = []
+              for skill in skill_list:
+                  # Use word boundary to match whole words
+                  pattern = r'\b' + re.escape(skill) + r'\b'
+                  if re.search(pattern, text_lower):
+                      found_skills.append(skill)
+              
+              return found_skills
+
+          def match_jobs_with_skills(skills, user_id):
+              if not skills:
+                  logger.info("No skills to match")
+                  return 0
+                  
+              try:
+                  # Get all jobs
+                  jobs_table = dynamodb.Table(JOBS_TABLE)
+                  matches_table = dynamodb.Table(MATCHES_TABLE)
+                  
+                  # Scan for all jobs
+                  jobs_response = jobs_table.scan()
+                  jobs = jobs_response.get('Items', [])
+                  
+                  logger.info(f"Found {len(jobs)} jobs to match against")
+                  
+                  # Match against each job
+                  matches_found = 0
+                  
+                  for job in jobs:
+                      job_id = job.get('jobId')
+                      job_title = job.get('title', 'Unknown Job')
+                      
+                      # Extract required skills (handle different formats)
+                      required_skills = []
+                      
+                      # Handle different ways skills might be stored
+                      if 'requiredSkills' in job:
+                          if isinstance(job['requiredSkills'], list):
+                              required_skills = job['requiredSkills']
+                          elif isinstance(job['requiredSkills'], dict) and 'L' in job['requiredSkills']:
+                              # DynamoDB format
+                              skill_items = job['requiredSkills']['L']
+                              for item in skill_items:
+                                  if 'S' in item:
+                                      required_skills.append(item['S'])
+                      
+                      logger.info(f"Job: {job_title}, Required skills: {required_skills}")
+                      
+                      # Check for matching skills
+                      matching_skills = []
+                      for skill in skills:
+                          if skill in required_skills:
+                              matching_skills.append(skill)
+                      
+                      # Calculate match percentage
+                      if required_skills and matching_skills:
+                          match_score = int((len(matching_skills) / len(required_skills)) * 100)
+                          logger.info(f"Match score: {match_score}% for job {job_title}")
+                          
+                          # Record match if score is good enough
+                          if match_score >= 50:
+                              timestamp = datetime.now().isoformat()
+                              
+                              # Save to DynamoDB
+                              match_item = {
+                                  'userId': user_id,
+                                  'jobId': job_id,
+                                  'jobTitle': job_title,
+                                  'skillScore': match_score,
+                                  'matchingSkills': matching_skills,
+                                  'matchTimestamp': timestamp
+                              }
+                              
+                              matches_table.put_item(Item=match_item)
+                              matches_found += 1
+                              logger.info(f"Saved match in DynamoDB: {user_id} - {job_title}")
+                      
+                  return matches_found
+                  
+              except Exception as e:
+                  logger.error(f"Error in job matching: {str(e)}", exc_info=True)
+                  return 0
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+  JobProcessorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: SkillSpotter-JobProcessor
+      Handler: index.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import urllib.parse
+          from datetime import datetime
+          import re
+          import logging
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize AWS clients with explicit region
+          region = os.environ.get('AWS_REGION', 'us-east-1')
+          s3 = boto3.client('s3', region_name=region)
+          dynamodb = boto3.resource('dynamodb', region_name=region)
+          comprehend = boto3.client('comprehend', region_name=region)
+          sns = boto3.client('sns', region_name=region)
+
+          # Constants
+          JOBS_TABLE = 'SkillSpotter-Jobs'
+          RESUME_TABLE = 'SkillSpotter-Resumes'
+          MATCHES_TABLE = 'SkillSpotter-SkillMatches'
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+
+          def lambda_handler(event, context):
+              logger.info(f"Event received: {json.dumps(event)}")
+              
+              try:
+                  # Extract bucket and key from S3 event
+                  bucket = None
+                  key = None
+                  
+                  if 'Records' in event and len(event['Records']) > 0 and 's3' in event['Records'][0]:
+                      bucket = event['Records'][0]['s3']['bucket']['name']
+                      key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'])
+                      logger.info(f"Processing job from S3 event: {bucket}/{key}")
+                  else:
+                      # For manual testing
+                      bucket = event.get('bucket', '')
+                      key = event.get('key', '')
+                      if key:
+                          key = urllib.parse.unquote_plus(key)
+                      logger.info(f"Processing from manual event: {bucket}/{key}")
+                  
+                  if not bucket or not key:
+                      error_msg = "No bucket or key specified in event"
+                      logger.error(error_msg)
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Skip if it's just the directory
+                  if key.endswith('/'):
+                      logger.info(f"Skipping directory: {key}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'message': 'Skipped directory'})
+                      }
+                  
+                  # Generate a unique ID for this job
+                  job_id = str(uuid.uuid4())
+                  
+                  try:
+                      # Get the file content
+                      logger.info(f"Getting S3 object: {bucket}/{key}")
+                      response = s3.get_object(Bucket=bucket, Key=key)
+                      content_type = response.get('ContentType', '')
+                      logger.info(f"File content type: {content_type}")
+                      
+                      # Parse JSON if it's a JSON file
+                      job_data = None
+                      try:
+                          if 'json' in content_type.lower() or key.lower().endswith('.json'):
+                              file_content = response['Body'].read().decode('utf-8')
+                              job_data = json.loads(file_content)
+                              logger.info(f"Parsed JSON job data: {job_data}")
+                          else:
+                              error_msg = f"Unsupported file type: {content_type}. Expected JSON."
+                              logger.error(error_msg)
+                              raise ValueError(error_msg)
+                      except Exception as parse_error:
+                          error_msg = f"Error parsing JSON data: {str(parse_error)}"
+                          logger.error(error_msg)
+                          raise ValueError(error_msg)
+                      
+                      # Extract job details
+                      job_title = job_data.get('title', 'Unknown Job')
+                      company = job_data.get('company', 'Unknown Company')
+                      location = job_data.get('location', 'Unknown Location')
+                      description = job_data.get('description', '')
+                      
+                  except Exception as get_error:
+                      error_msg = f"Error processing file: {str(get_error)}"
+                      logger.error(error_msg)
+                      return {
+                          'statusCode': 500,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Extract skills from job description
+                  required_skills = extract_skills_from_job(description)
+                  logger.info(f"Extracted required skills: {required_skills}")
+                  
+                  # Store in DynamoDB
+                  jobs_table = dynamodb.Table(JOBS_TABLE)
+                  timestamp = datetime.now().isoformat()
+                  
+                  job_item = {
+                      'jobId': job_id,
+                      'title': job_title,
+                      'company': company,
+                      'location': location,
+                      'description': description,
+                      'requiredSkills': required_skills,
+                      'originalKey': key,
+                      'postTimestamp': timestamp,
+                      'status': 'ACTIVE'
+                  }
+                  
+                  jobs_table.put_item(Item=job_item)
+                  logger.info(f"Job data stored in DynamoDB with ID: {job_id}")
+                  
+                  # Match with existing resumes
+                  match_count, matched_users = match_resumes_with_job(job_id, job_title, required_skills)
+                  logger.info(f"Found {match_count} resume matches for this job")
+                  
+                  # Notify users of matches if any
+                  if match_count > 0 and matched_users:
+                      # Send notification for each matched user (in real app, would be personalized per user)
+                      sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject="New Job Matching Your Skills",
+                          Message=f"A new job '{job_title}' at {company} matches your skills! Check your dashboard for details."
+                      )
+                      logger.info(f"SNS notification sent to topic: {SNS_TOPIC_ARN}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Job processed successfully',
+                          'jobId': job_id,
+                          'jobTitle': job_title,
+                          'matches': match_count
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing job: {str(e)}", exc_info=True)
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+
+          def extract_skills_from_job(description):
+              # Convert to lowercase for case-insensitive matching
+              text_lower = description.lower()
+              
+              # Use the same skill list as in resume processing for consistency
+              skill_list = [
+                  "python", "java", "javascript", "html", "css", "react", "angular", "vue", 
+                  "node.js", "express", "django", "flask", "spring", "spring boot", "hibernate", 
+                  "sql", "mysql", "postgresql", "mongodb", "nosql", "oracle", 
+                  "aws", "azure", "gcp", "docker", "kubernetes", "jenkins", "git", 
+                  "agile", "scrum", "jira", "devops", "ci/cd", "terraform",
+                  "machine learning", "deep learning", "ai", "data science", "data analysis",
+                  "tableau", "power bi", "excel", "word", "powerpoint", "typescript",
+                  "project management", "leadership", "communication", "teamwork", "kotlin",
+                  "react.js", "node.js", "nosql", "rest", "restful", "api", "apis", "json",
+                  "xml", "linux", "unix", "bash", "shell", "c++", "c#", ".net", "perl",
+                  "responsive", "mobile", "spark", "hadoop", "kafka", "redis", "elasticsearch"
+              ]
+              
+              # Find skills in text
+              found_skills = []
+              for skill in skill_list:
+                  # Use word boundary to match whole words
+                  pattern = r'\b' + re.escape(skill) + r'\b'
+                  if re.search(pattern, text_lower):
+                      found_skills.append(skill)
+              
+              # Add entities detected by Amazon Comprehend (if available)
+              try:
+                  # Limit text to 5000 bytes for Comprehend (its maximum)
+                  truncated_text = description[:5000]
+                  
+                  # Detect key phrases
+                  comprehend_response = comprehend.detect_key_phrases(
+                      Text=truncated_text,
+                      LanguageCode='en'
+                  )
+                  
+                  for phrase in comprehend_response.get('KeyPhrases', []):
+                      phrase_text = phrase.get('Text', '').lower()
+                      
+                      # Check if the key phrase is a skill not already in our list
+                      for skill in skill_list:
+                          if skill in phrase_text and skill not in found_skills:
+                              found_skills.append(skill)
+              except Exception as comprehend_error:
+                  logger.error(f"Error using Comprehend: {str(comprehend_error)}")
+                  # Continue without Comprehend results
+              
+              return found_skills
+
+          def match_resumes_with_job(job_id, job_title, required_skills):
+              if not required_skills:
+                  logger.info("No required skills to match")
+                  return 0, []
+                  
+              try:
+                  # Get all resumes
+                  resume_table = dynamodb.Table(RESUME_TABLE)
+                  matches_table = dynamodb.Table(MATCHES_TABLE)
+                  
+                  # Scan for all resumes
+                  resumes_response = resume_table.scan()
+                  resumes = resumes_response.get('Items', [])
+                  
+                  logger.info(f"Found {len(resumes)} resumes to match against")
+                  
+                  # Match against each resume
+                  matches_found = 0
+                  matched_users = []
+                  
+                  for resume in resumes:
+                      user_id = resume.get('userId')
+                      resume_id = resume.get('resumeId')
+                      
+                      # Skip if we don't have a valid user ID
+                      if not user_id:
+                          continue
+                      
+                      # Extract skills from resume
+                      resume_skills = resume.get('extractedSkills', [])
+                      
+                      # Check for matching skills
+                      matching_skills = []
+                      for skill in resume_skills:
+                          if skill in required_skills:
+                              matching_skills.append(skill)
+                      
+                      # Calculate match percentage
+                      if required_skills and matching_skills:
+                          match_score = int((len(matching_skills) / len(required_skills)) * 100)
+                          logger.info(f"Match score: {match_score}% for user {user_id}")
+                          
+                          # Record match if score is good enough
+                          if match_score >= 50:
+                              timestamp = datetime.now().isoformat()
+                              
+                              # Save to DynamoDB
+                              match_item = {
+                                  'userId': user_id,
+                                  'jobId': job_id,
+                                  'jobTitle': job_title,
+                                  'skillScore': match_score,
+                                  'matchingSkills': matching_skills,
+                                  'matchTimestamp': timestamp
+                              }
+                              
+                              matches_table.put_item(Item=match_item)
+                              matches_found += 1
+                              matched_users.append(user_id)
+                              logger.info(f"Saved match in DynamoDB: {user_id} - {job_title}")
+                      
+                  return matches_found, matched_users
+                  
+              except Exception as e:
+                  logger.error(f"Error in resume matching: {str(e)}", exc_info=True)
+                  return 0, []
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+
+  #############################################
+  # CLOUDWATCH DASHBOARD RESOURCES
+  #############################################
+  SkillSpotterDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: 'SkillSpotter-MainDashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "SkillSpotter-Auth", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "SkillSpotter-JobManagement", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "SkillSpotter-ResumeProcessor", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "SkillSpotter-JobProcessor", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Invocations",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Errors", "FunctionName", "SkillSpotter-Auth", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "SkillSpotter-JobManagement", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "SkillSpotter-ResumeProcessor", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "SkillSpotter-JobProcessor", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Errors",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "SkillSpotter-Auth", { "stat": "Average", "period": 300 } ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "SkillSpotter-JobManagement", { "stat": "Average", "period": 300 } ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "SkillSpotter-ResumeProcessor", { "stat": "Average", "period": 300 } ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "SkillSpotter-JobProcessor", { "stat": "Average", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Duration",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "SkillSpotter-API", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/ApiGateway", "4XXError", "ApiName", "SkillSpotter-API", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/ApiGateway", "5XXError", "ApiName", "SkillSpotter-API", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "API Gateway Requests and Errors",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "SkillSpotter-Users", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "SkillSpotter-Users", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Users Table Capacity Units",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 12,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "SkillSpotter-Jobs", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "SkillSpotter-Jobs", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Jobs Table Capacity Units",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 12,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "SkillSpotter-Resumes", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "SkillSpotter-Resumes", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Resumes Table Capacity Units",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 18,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${ResumeBucket}", "StorageType", "StandardStorage", { "period": 86400 } ],
+                  [ "AWS/S3", "BucketSizeBytes", "BucketName", "${JobDescBucket}", "StorageType", "StandardStorage", { "period": 86400 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Bucket Sizes",
+                "period": 86400
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 18,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "AllRequests", "BucketName", "${ResumeBucket}", { "stat": "Sum", "period": 3600 } ],
+                  [ "AWS/S3", "AllRequests", "BucketName", "${JobDescBucket}", { "stat": "Sum", "period": 3600 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "S3 Bucket Requests",
+                "period": 3600
+              }
+            }
+          ]
+        }
+
+  ResumeProcessingDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: 'SkillSpotter-ResumeProcessing'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "SkillSpotter-ResumeProcessor", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Resume Processor Invocations",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "SkillSpotter-ResumeProcessor", { "stat": "Average", "period": 300 } ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "SkillSpotter-ResumeProcessor", { "stat": "Maximum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Resume Processor Duration",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "PutRequests", "BucketName", "${ResumeBucket}", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/S3", "GetRequests", "BucketName", "${ResumeBucket}", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Resume S3 Bucket Operations",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/SkillSpotter-ResumeProcessor' | filter @message like 'Error' | stats count(*) as ErrorCount by bin(5m)",
+                "region": "${AWS::Region}",
+                "stacked": false,
+                "title": "Resume Processing Errors",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+  JobManagementDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: 'SkillSpotter-JobManagement'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "SkillSpotter-JobManagement", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "SkillSpotter-JobProcessor", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Job Functions Invocations",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "SkillSpotter-JobManagement", { "stat": "Average", "period": 300 } ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "SkillSpotter-JobProcessor", { "stat": "Average", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Job Functions Duration",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/S3", "PutRequests", "BucketName", "${JobDescBucket}", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/S3", "GetRequests", "BucketName", "${JobDescBucket}", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Job Description S3 Bucket Operations",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "SkillSpotter-Jobs", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "SkillSpotter-Jobs", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "SkillSpotter-SkillMatches", { "stat": "Sum", "period": 300 } ],
+                  [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "SkillSpotter-SkillMatches", { "stat": "Sum", "period": 300 } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Job & Skill Matches Tables Capacity",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for monitoring
+  AuthLambdaErrorAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SkillSpotter-AuthLambdaErrors'
+      AlarmDescription: 'Alarm for Auth Lambda function errors'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Sum'
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AuthLambdaFunction
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: 'GreaterThanThreshold'
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: 'notBreaching'
+
+  ResumeProcessorErrorAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SkillSpotter-ResumeProcessorErrors'
+      AlarmDescription: 'Alarm for Resume Processor Lambda function errors'
+      MetricName: 'Errors'
+      Namespace: 'AWS/Lambda'
+      Statistic: 'Sum'
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ResumeProcessorFunction
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: 'GreaterThanThreshold'
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: 'notBreaching'
+
+  ApiGateway5xxErrorAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmName: 'SkillSpotter-ApiGateway5xxErrors'
+      AlarmDescription: 'Alarm for API Gateway 5xx errors'
+      MetricName: '5XXError'
+      Namespace: 'AWS/ApiGateway'
+      Statistic: 'Sum'
+      Dimensions:
+        - Name: ApiName
+          Value: 'SkillSpotter-API'
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: 'GreaterThanThreshold'
+      AlarmActions:
+        - !Ref NotificationTopic
+      TreatMissingData: 'notBreaching'
+
+  ## EC2 Frontend Instance
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - "LabRole"
+
+  FrontendEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      ImageId: ami-012967cc5a8c9f891
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref FrontendSecurityGroup
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            sudo su - root
+            sudo dnf update -y
+            
+            # Install Docker
+            sudo dnf install docker -y
+            sudo systemctl enable docker
+            sudo systemctl start docker
+            sudo usermod -aG docker ec2-user
+            
+            # Create config directory for runtime configuration
+            mkdir -p /tmp/config
+            
+            # Create config.js for runtime configuration
+            sudo cat > /tmp/config/config.js << EOF
+            window.APP_CONFIG = {
+              apiUrl: 'https://${AuthApi}.execute-api.${AWS::Region}.amazonaws.com/prod',
+              region: '${AWS::Region}',
+              resumeBucket: '${ResumeBucket}',
+              jobDescBucket: '${JobDescBucket}',
+              environment: 'production'
+            };
+            console.log('Config loaded:', window.APP_CONFIG);
+            EOF
+      
+            # Pull and run the Docker container
+            sudo docker pull dhruv302019/skillspotter-frontend:latest
+            
+            # Run the container with the config mounted
+            sudo docker run -d \
+                -p 80:80 \
+                -v /tmp/config/config.js:/usr/share/nginx/html/config.js \
+                --name skillspotter-frontend \
+                --restart always \
+                dhruv302019/skillspotter-frontend:latest
+
+  FrontendElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  FrontendEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      EIP: !Ref FrontendElasticIP  
+      InstanceId: !Ref FrontendEC2Instance
+
+  ## Glue Job for Analytics
+  GlueScriptUploadLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      script_key = event['ResourceProperties']['ScriptKey']
+                      script_content = event['ResourceProperties']['ScriptContent']
+                      
+                      s3 = boto3.client('s3')
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key=script_key,
+                          Body=script_content,
+                          ContentType='text/x-python'
+                      )
+                      
+                      print(f"Script uploaded to s3://{bucket_name}/{script_key}")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+
+  GlueScriptUpload:
+    Type: 'Custom::UploadScript'
+    DependsOn: GlueScriptBucket
+    Properties:
+      ServiceToken: !GetAtt GlueScriptUploadLambda.Arn
+      BucketName: !Ref GlueScriptBucket
+      ScriptKey: 'scripts/resume_skill_analytics.py'
+      ScriptContent: |
+  
+          import sys
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+          import logging
+          
+          # Set up logging
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger(__name__)
+          
+          # Parse arguments
+          args = {}
+          for i in range(len(sys.argv)):
+              if sys.argv[i].startswith('--'):
+                  if i+1 < len(sys.argv) and not sys.argv[i+1].startswith('--'):
+                      args[sys.argv[i][2:]] = sys.argv[i+1]
+                  else:
+                      args[sys.argv[i][2:]] = True
+          
+          # Get user ID from arguments, or process all users if not specified
+          user_id = args.get('userId', None)
+          if user_id:
+              logger.info(f"Starting skill analysis for specific user: {user_id}")
+          else:
+              logger.info("No userId specified, will analyze recent uploads")
+          
+          # Initialize AWS clients
+          region = os.environ.get('AWS_REGION', 'us-east-1')
+          dynamodb = boto3.resource('dynamodb', region_name=region)
+          sns = boto3.client('sns', region_name=region)
+          
+          # Constants
+          RESUME_TABLE = 'SkillSpotter-Resumes'
+          JOBS_TABLE = 'SkillSpotter-Jobs'
+          SNS_TOPICS = boto3.client('sns', region_name=region).list_topics()
+          SNS_TOPIC_ARN = None
+          
+          # Find the SNS topic ARN
+          for topic in SNS_TOPICS.get('Topics', []):
+              if 'SkillSpotter-Notifications' in topic.get('TopicArn', ''):
+                  SNS_TOPIC_ARN = topic.get('TopicArn')
+                  break
+          
+          if not SNS_TOPIC_ARN:
+              logger.warning("SNS topic not found, using default name")
+              SNS_TOPIC_ARN = 'SkillSpotter-Notifications'
+          
+          try:
+              # Get all jobs and their required skills
+              logger.info("Scanning jobs table")
+              jobs_table = dynamodb.Table(JOBS_TABLE)
+              jobs_response = jobs_table.scan()
+              jobs = jobs_response.get('Items', [])
+              
+              # Initialize job skills dictionary
+              job_skills = {}
+              
+              for job in jobs:
+                  job_id = job.get('jobId')
+                  job_title = job.get('title', 'Unknown Job')
+                  
+                  # Extract required skills
+                  required_skills = []
+                  if 'requiredSkills' in job:
+                      if isinstance(job['requiredSkills'], list):
+                          required_skills = job['requiredSkills']
+                      elif isinstance(job['requiredSkills'], dict) and 'L' in job['requiredSkills']:
+                          # DynamoDB format
+                          skill_items = job['requiredSkills']['L']
+                          for item in skill_items:
+                              if 'S' in item:
+                                  required_skills.append(item['S'])
+                  
+                  job_skills[job_id] = {
+                      'title': job_title,
+                      'skills': required_skills
+                  }
+              
+              # Count skill frequency across all jobs
+              skill_count = {}
+              for job_id, job_data in job_skills.items():
+                  for skill in job_data['skills']:
+                      skill_count[skill] = skill_count.get(skill, 0) + 1
+              
+              # Sort skills by demand
+              top_skills = sorted(skill_count.items(), key=lambda x: x[1], reverse=True)
+              
+              # Get users to process
+              resume_table = dynamodb.Table(RESUME_TABLE)
+              users_to_process = []
+              
+              if user_id:
+                  # Process specific user
+                  users_to_process.append(user_id)
+              else:
+                  # Process all users with recent uploads (last 24 hours)
+                  try:
+                      # Get all resumes
+                      resume_response = resume_table.scan()
+                      resumes = resume_response.get('Items', [])
+                      
+                      # Extract unique user IDs
+                      unique_users = set()
+                      for resume in resumes:
+                          unique_users.add(resume.get('userId'))
+                      
+                      users_to_process = list(unique_users)
+                      logger.info(f"Found {len(users_to_process)} unique users to process")
+                      
+                      # Limit to reasonable number if needed
+                      if len(users_to_process) > 50:
+                          users_to_process = users_to_process[:50]
+                          logger.info(f"Limiting to 50 users for this run")
+                  except Exception as e:
+                      logger.error(f"Error getting users: {str(e)}")
+                      # If we can't get all users, default to analyzing recent uploads
+                      resume_response = resume_table.scan(Limit=10)
+                      resumes = resume_response.get('Items', [])
+                      for resume in resumes:
+                          user_id = resume.get('userId')
+                          if user_id and user_id not in users_to_process:
+                              users_to_process.append(user_id)
+              
+              # Process each user
+              for current_user_id in users_to_process:
+                  logger.info(f"Processing user: {current_user_id}")
+                  
+                  # Get user's skills from latest resume
+                  user_skills = []
+                  try:
+                      resume_response = resume_table.scan(
+                          FilterExpression='userId = :userId',
+                          ExpressionAttributeValues={':userId': current_user_id}
+                      )
+                      
+                      resumes = resume_response.get('Items', [])
+                      if resumes:
+                          # Sort by timestamp (newest first)
+                          resumes.sort(key=lambda x: x.get('uploadTimestamp', ''), reverse=True)
+                          latest_resume = resumes[0]
+                          user_skills = latest_resume.get('extractedSkills', [])
+                          logger.info(f"Found {len(user_skills)} skills for user {current_user_id}")
+                      else:
+                          logger.info(f"No resumes found for user {current_user_id}, skipping")
+                          continue
+                  except Exception as e:
+                      logger.error(f"Error querying resumes for user {current_user_id}: {str(e)}")
+                      continue
+                  
+                  # Find skill gaps
+                  skill_gaps = []
+                  for skill, count in top_skills[:10]:  # Top 10 in-demand skills
+                      if skill not in user_skills:
+                          skill_gaps.append({
+                              'skill': skill,
+                              'demand_count': count
+                          })
+                  
+                  # Generate analytics result
+                  result = {
+                      'timestamp': datetime.now().isoformat(),
+                      'userId': current_user_id,
+                      'top_skills_in_demand': top_skills[:10],
+                      'user_skills': user_skills,
+                      'skill_gaps': skill_gaps[:5],
+                      'job_count': len(jobs)
+                  }
+                  
+                  logger.info(f"Analytics result for user {current_user_id}: {len(skill_gaps)} skill gaps identified")
+                  
+                  # Notify user of skill gaps
+                  if skill_gaps:
+                      skill_gaps_text = ", ".join([gap['skill'] for gap in skill_gaps[:5]])
+                      message = f"Based on our analysis of {len(jobs)} jobs, you may want to consider developing these in-demand skills: {skill_gaps_text}"
+                      
+                      try:
+                          sns.publish(
+                              TopicArn=SNS_TOPIC_ARN,
+                              Subject=f"Skill Gap Analysis for User {current_user_id}",
+                              Message=message
+                          )
+                          logger.info(f"SNS notification sent for user {current_user_id}")
+                      except Exception as sns_error:
+                          logger.error(f"Error sending SNS notification for user {current_user_id}: {str(sns_error)}")
+                  else:
+                      logger.info(f"No skill gaps found for user {current_user_id}")
+              
+              logger.info("Skill analysis complete for all users")
+              
+          except Exception as e:
+              logger.error(f"Error in Glue job: {str(e)}")
+              raise e
+
+  SkillAnalyticsGlueJob:
+    Type: 'AWS::Glue::Job'
+    Properties:
+      Name: SkillSpotter-SkillAnalytics
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      ExecutionProperty:
+        MaxConcurrentRuns: 5  # Allow multiple concurrent runs (one per user)
+      Command:
+        Name: pythonshell
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${GlueScriptBucket}/scripts/resume_skill_analytics.py'
+      DefaultArguments:
+        '--job-bookmark-option': 'job-bookmark-disable'
+        # No hardcoded userId here
+      MaxRetries: 0
+      Timeout: 30
+      GlueVersion: '1.0'
+
+  #############################################
+  # EVENT RESOURCES
+  #############################################
+  
+  ## S3 Event Notification for Resume Bucket
+  ResumeNotificationFunction:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+      - ResumeBucket
+      - ResumeProcessorFunction
+    Properties:
+      Handler: index.handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import os
+          
+          def handler(event, context):
+              try:
+                  print(f"Received event: {json.dumps(event)}")
+                  
+                  # Extract configuration from environment variables
+                  bucket_name = os.environ['BUCKET_NAME']
+                  lambda_arn = os.environ['LAMBDA_ARN']
+                  
+                  # Only configure on Create or Update
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Configure S3 notification
+                      s3 = boto3.client('s3')
+                      notification_config = {
+                          'LambdaFunctionConfigurations': [
+                              {
+                                  'Id': 'ResumeTrigger',
+                                  'LambdaFunctionArn': lambda_arn,
+                                  'Events': ['s3:ObjectCreated:*'],
+                                  'Filter': {
+                                      'Key': {
+                                          'FilterRules': [
+                                              {
+                                                  'Name': 'prefix',
+                                                  'Value': 'uploads/'
+                                              }
+                                          ]
+                                      }
+                                  }
+                              }
+                          ]
+                      }
+                      
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket_name,
+                          NotificationConfiguration=notification_config
+                      )
+                      
+                      print(f"Successfully set notification on bucket {bucket_name} to trigger Lambda {lambda_arn}")
+                  
+                  # Always send a SUCCESS response to CloudFormation
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': f'S3 notification configured for bucket {bucket_name}'
+                  })
+                  
+              except Exception as e:
+                  print(f"Error setting up S3 notification: {str(e)}")
+                  # Send a FAILED response to CloudFormation
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ResumeBucket
+          LAMBDA_ARN: !GetAtt ResumeProcessorFunction.Arn
+
+  ResumeSetupNotificationInvoke:
+    Type: 'AWS::CloudFormation::CustomResource'
+    DependsOn:
+      - ResumeNotificationFunction
+      - ResumeProcessorPermission
+    Properties:
+      ServiceToken: !GetAtt ResumeNotificationFunction.Arn
+
+  ## S3 Event Notification for Job Description Bucket
+  JobDescNotificationFunction:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+      - JobDescBucket
+      - JobProcessorFunction
+    Properties:
+      Handler: index.handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import os
+          
+          def handler(event, context):
+              try:
+                  print(f"Received event: {json.dumps(event)}")
+                  
+                  # Extract configuration from environment variables
+                  bucket_name = os.environ['BUCKET_NAME']
+                  lambda_arn = os.environ['LAMBDA_ARN']
+                  
+                  # Only configure on Create or Update
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Configure S3 notification
+                      s3 = boto3.client('s3')
+                      notification_config = {
+                          'LambdaFunctionConfigurations': [
+                              {
+                                  'Id': 'JobDescTrigger',
+                                  'LambdaFunctionArn': lambda_arn,
+                                  'Events': ['s3:ObjectCreated:*'],
+                                  'Filter': {
+                                      'Key': {
+                                          'FilterRules': [
+                                              {
+                                                  'Name': 'prefix',
+                                                  'Value': 'jobs/'
+                                              }
+                                          ]
+                                      }
+                                  }
+                              }
+                          ]
+                      }
+                      
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket_name,
+                          NotificationConfiguration=notification_config
+                      )
+                      
+                      print(f"Successfully set notification on bucket {bucket_name} to trigger Lambda {lambda_arn}")
+                  
+                  # Always send a SUCCESS response to CloudFormation
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Message': f'S3 notification configured for bucket {bucket_name}'
+                  })
+                  
+              except Exception as e:
+                  print(f"Error setting up S3 notification: {str(e)}")
+                  # Send a FAILED response to CloudFormation
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref JobDescBucket
+          LAMBDA_ARN: !GetAtt JobProcessorFunction.Arn
+
+  JobDescSetupNotificationInvoke:
+    Type: 'AWS::CloudFormation::CustomResource'
+    DependsOn:
+      - JobDescNotificationFunction
+      - JobProcessorPermission
+    Properties:
+      ServiceToken: !GetAtt JobDescNotificationFunction.Arn
+
+  #############################################
+  # OUTPUTS
+  #############################################
+  
+Outputs:
+  FrontendURL:
+    Description: URL to access the SkillSpotter frontend
+    Value: !Sub "http://${FrontendElasticIP}"
+
+  ApiGatewayURL:
+    Description: URL for the API Gateway endpoint
+    Value: !Sub "https://${AuthApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    
+  AuthEndpoint:
+    Description: Authentication API endpoint
+    Value: !Sub "https://${AuthApi}.execute-api.${AWS::Region}.amazonaws.com/prod/auth"
+
+  JobsEndpoint:
+    Description: Public jobs API endpoint
+    Value: !Sub "https://${AuthApi}.execute-api.${AWS::Region}.amazonaws.com/prod/jobs"
+
+  AdminJobsEndpoint:
+    Description: Admin jobs management endpoint
+    Value: !Sub "https://${AuthApi}.execute-api.${AWS::Region}.amazonaws.com/prod/admin/jobs"
+
+  ResumeUploadEndpoint:
+    Description: Resume upload API endpoint
+    Value: !Sub "https://${AuthApi}.execute-api.${AWS::Region}.amazonaws.com/prod/user/resume/upload"
+
+  SSHAccess:
+    Description: SSH access command for the frontend server
+    Value: !Sub "ssh -i ${KeyPairName}.pem ec2-user@${FrontendElasticIP}"
+
+  ResumeBucketName:
+    Description: Name of the resume storage bucket
+    Value: !Ref ResumeBucket
+
+  JobDescBucketName:
+    Description: Name of the job description storage bucket
+    Value: !Ref JobDescBucket
+
+  SNSTopicARN:
+    Description: ARN of the SNS topic for job match notifications
+    Value: !Ref NotificationTopic
+    
+  MainDashboardURL:
+    Description: URL for the main CloudWatch dashboard
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=SkillSpotter-MainDashboard"
+    
+  ResumeProcessingDashboardURL:
+    Description: URL for the resume processing CloudWatch dashboard
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=SkillSpotter-ResumeProcessing"
+    
+  JobManagementDashboardURL:
+    Description: URL for the job management CloudWatch dashboard
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=SkillSpotter-JobManagement"
