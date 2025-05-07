@@ -14,7 +14,6 @@ SkillSpotter is a cloud-native web application designed to intelligently match j
 - [CloudFormation Deployment](#cloudformation-deployment)
 - [Monitoring](#monitoring)
 - [Contributing](#contributing)
-- [License](#license)
 
 ## Architecture
 
